@@ -1,13 +1,17 @@
+from collections.abc import Sequence
 from dataclasses import dataclass, field, fields
-from operator import mul
 from functools import reduce
+from operator import mul
 
 import numpy as np
+import qutip
 from plotly import graph_objects as go
 from plotly.subplots import make_subplots
-import qutip
-from qutip import destroy, tensor, qeye, sigmax, mesolve, steadystate, basis, spectrum, expect
+from qutip import basis, destroy, expect, mesolve, qeye, sigmax, spectrum, steadystate, tensor
+from qutip.parallel import parallel_map
+from threadpoolctl import threadpool_limits
 from tqdm import tqdm
+
 
 @dataclass
 class Emitter:
@@ -38,7 +42,7 @@ class Cavity:
                         )
                 else:
                     setattr(self, field_.name, [value] * self.num_emitters)
-    
+
     @property
     def emitters(self):
         yield from [
@@ -55,7 +59,7 @@ class Cavity:
         l = [qeye(self.num_photons + 1)]
         l += [destroy(2) if emitter == i else qeye(2) for i in range(self.num_emitters)]
         return tensor(l)
-    
+
     def sigma_x(self, emitter: int):
         l = [qeye(self.num_photons + 1)]
         l += [sigmax() if emitter == i else qeye(2) for i in range(self.num_emitters)]
@@ -75,7 +79,7 @@ class Cavity:
         if pump_power is not None:
             return ops + [pump_power * self.a().dag()]
         return ops
-    
+
     def steady_state(self, pump_frequency: float | None = None, pump_power: float | None = None):
         H = self.hamiltonian(pump_frequency, pump_power)
         return steadystate(H, self.collapse_ops(pump_power))
@@ -92,7 +96,7 @@ class Cavity:
             sigma = self.sigma(i)
             number_ops.append(sigma.dag() * sigma)
         return number_ops
-    
+
     def hamiltonian(self, pump_freq: float | None = None, pump_rate: float = 1):
         """Returns the full qutip hamiltonian"""
         a = self.a()
@@ -100,7 +104,9 @@ class Cavity:
             H = (self.cavity_freq - pump_freq) * a.dag() * a
             for i, emitter in enumerate(self.emitters):
                 s = self.sigma(i)
-                H += 0.5 * (emitter.frequency - pump_freq) * s.dag() * s + emitter.g * (a.dag() * s + a * s.dag())
+                H += 0.5 * (emitter.frequency - pump_freq) * s.dag() * s + emitter.g * (
+                    a.dag() * s + a * s.dag()
+                )
                 H += pump_rate * (a + a.dag())
             return H
 
@@ -108,16 +114,19 @@ class Cavity:
             H = self.cavity_freq * a.dag() * a
             for i, emitter in enumerate(self.emitters):
                 s = self.sigma(i)
-                H += emitter.frequency * s.dag() * s 
+                H += emitter.frequency * s.dag() * s
                 H += emitter.g * (a.dag() * s + a * s.dag())
             return H
 
     def cavity_state(self, num_photons: int):
         if num_photons > self.num_photons:
             raise ValueError(f"Cavity can only accept up to {self.num_photons}.")
-        return tensor(basis(self.num_photons + 1, num_photons), *([basis(2, 0)] * self.num_emitters))
+        return tensor(
+            basis(self.num_photons + 1, num_photons),
+            *([basis(2, 0)] * self.num_emitters),
+        )
 
-    def excited_emitter_state(self, excited_emitter_index: int):
+    def emitter_state(self, excited_emitter_index: int):
         """Create a state where one emitter has 100% of the excitation."""
 
         if excited_emitter_index < 0:
@@ -139,13 +148,13 @@ class Cavity:
         states = []
         for i in range(self.num_emitters):
             phase = np.exp(-1j * i * 2 * np.pi / self.num_emitters) / np.sqrt(self.num_emitters)
-            states.append(phase * self.excited_emitter_state(i))
+            states.append(phase * self.emitter_state(i))
         return sum(states)
 
     def superradiant_state(self):
         states = []
         for i in range(self.num_emitters):
-            states.append(self.excited_emitter_state(i))
+            states.append(self.emitter_state(i))
         return sum(states) / np.sqrt(self.num_emitters)
 
     def mesolve(self, initial_state, times, measurements=None, pump_freq=None, pump_rate=1):
@@ -155,8 +164,36 @@ class Cavity:
         measurements = measurements or self.excitation_likelihoods()
         return mesolve(H, initial_state, times, c_ops, measurements)
 
+    def product_state(self, cavity: int = 0, **kwargs):
+        if cavity > self.num_photons:
+            raise ValueError(f"Cavity can only accept up to {self.num_photons}.")
+        if max(kwargs.values()) > 1:
+            raise ValueError("Emitters can only have states 0 or 1.")
 
-def plot_populations(result: qutip.solver.Result, title: str = ''):
+        emitter_states = [basis(2, kwargs.get(f"emitter_{i}", 0)) for i in range(self.num_emitters)]
+        return tensor(basis(self.num_photons + 1, cavity), *emitter_states)
+
+    def effective_hamiltonian(self):
+        emitter_terms = [
+            self.gamma[i] / 2 * self.sigma(i).dag() * self.sigma(i)
+            for i in range(self.num_emitters)
+        ]
+        a = self.a()
+        H_eff = self.hamiltonian() - 1j * self.kappa / 2 * a.dag() * a - 1j * sum(emitter_terms)
+        return H_eff
+
+    def emitter_quality(self, state):
+        return sum(
+            np.abs(self.emitter_state(i).overlap(state)) ** 2 for i in range(self.num_emitters)
+        )
+
+    def cavity_quality(self, state):
+        return sum(
+            np.abs(self.cavity_state(i).overlap(state)) ** 2 for i in range(self.num_photons + 1)
+        )
+
+
+def plot_populations(result: qutip.solver.Result, title: str = ""):
     """Make a plot of emitter and cavity populations over time."""
     fig = go.Figure()
     fig.add_trace(
@@ -188,47 +225,68 @@ def plot_populations(result: qutip.solver.Result, title: str = ''):
     fig.show()
 
 
-def zero_time_correlation_under_pump(
-    cavity: Cavity, orders: int | list[int], drive_frequencies, pump_power=None
+def g_correlations(
+    drive_freq: float, cavity: Cavity, orders: list[int], pump_power: float
+) -> float:
+    H = cavity.hamiltonian(pump_freq=drive_freq, pump_rate=pump_power)
+    a = cavity.a()
+    c_ops = cavity.collapse_ops()
+    ss = steadystate(H, c_ops)
+
+    correlation_ops = [cavity.g_zero_op(order=o) for o in orders]
+
+    correlations = [expect(ss, op) for op in correlation_ops]
+    n = expect(ss, a.dag() * a)
+
+    normalized_correlation = [corr / n**o for corr, o in zip(correlations, orders)]
+    return np.real(normalized_correlation)
+
+
+def g_correlation_swept_pump(
+    cavity: Cavity,
+    orders: int | list[int],
+    drive_frequencies: Sequence[float],
+    pump_power=None,
+    parallel=False,
 ) -> go.Figure:
     """Make a plot of zero-time correlations at the given orders and pump power."""
-    c_ops = cavity.collapse_ops()
-    a = cavity.a()
     pump_power = pump_power or cavity.kappa / 50
     orders = [orders] if isinstance(orders, int) else orders
 
-    correlations_expect = []
-    for wd in tqdm(drive_frequencies):
-        H = cavity.hamiltonian(pump_freq=wd, pump_rate=pump_power)
-        ss = steadystate(H, c_ops)
-
-        correlation_ops = [cavity.g_zero_op(order=o) for o in orders]
-
-        correlations = [expect(ss, op) for op in correlation_ops]
-        n = expect(ss, a.dag() * a)
-
-        normalized_correlation = [corr / n ** o for corr, o in zip(correlations, orders)]
-        correlations_expect.append(np.real(normalized_correlation))
+    if parallel:
+        # OpenBLAS (used by qutip) ordinarily uses multithreading. This interferes with multicore
+        # scheduling, preventing the use of `parallel_map`, so let's temporarily disable that.
+        with threadpool_limits(limits=1, user_api="blas"):
+            correlations_expect = parallel_map(
+                g_correlations,
+                drive_frequencies,
+                task_kwargs=dict(cavity=cavity, orders=orders, pump_power=pump_power),
+                progress_bar=True,
+            )
+    else:
+        # At this point I'm not sure if it's safe for all users to enable parallelism by default
+        correlations_expect = [
+            g_correlations(wd, cavity, orders, pump_power) for wd in tqdm(drive_frequencies)
+        ]
 
     correlations_expect = np.vstack(correlations_expect).T
 
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True)
     fig.update_yaxes(title="Zero-time correlations", row=1, col=1)
     fig.update_yaxes(title="Output spectrum", row=2, col=1)
-    fig.update_xaxes(title=r"$\omega - \omega_C$", row=1, col=2)
+    fig.update_xaxes(title="ω - ω_c", row=2, col=1)
 
+    # Plot the g-function correlations in the top panel
     for o, corr in zip(orders, correlations_expect):
-        fig.add_trace(
-            go.Scatter(x=drive_frequencies - cavity.cavity_freq, y=corr, name=f"g{o}(0)"),
-            row=1,
-            col=1,
-        )
-    
-    fig.add_trace(
-        go.Scatter(x=drive_frequencies - cavity.cavity_freq, y=cavity.spectrum(drive_frequencies)),
-        row=2,
-        col=1,
+        trace = go.Scatter(x=drive_frequencies - cavity.cavity_freq, y=corr, name=f"g{o}(0)")
+        fig.add_trace(trace, row=1, col=1)
+
+    # Plot the emission spectrum of the cavity in the lower panel
+    spectrum_trace = go.Scatter(
+        x=drive_frequencies - cavity.cavity_freq,
+        y=cavity.spectrum(drive_frequencies),
+        name="Transmission spectrum",
     )
+    fig.add_trace(spectrum_trace, row=2, col=1)
 
     return fig
-
