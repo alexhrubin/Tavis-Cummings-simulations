@@ -19,6 +19,19 @@ class Emitter:
     gamma: float
     frequency: float
 
+    _emitter_idx: int
+    _cavity_num_photons: int
+    _cavity_num_emitters: int
+
+    @property
+    def sigma(self):
+        """Returns the lowering operator for this emitter."""
+        emitter_ops = [
+            destroy(2) if self._emitter_idx == i else qeye(2)
+            for i in range(self._cavity_num_emitters)
+        ]
+        return tensor(qeye(self._cavity_num_photons + 1), *emitter_ops)
+
 
 @dataclass
 class Cavity:
@@ -45,20 +58,20 @@ class Cavity:
 
     @property
     def emitters(self):
-        yield from [
-            Emitter(g=self.g[i], gamma=self.gamma[i], frequency=self.emitter_freq[i])
+        kwargs = dict(_cavity_num_photons=self.num_photons, _cavity_num_emitters=self.num_emitters)
+        return [
+            Emitter(g=self.g[i], gamma=self.gamma[i], frequency=self.emitter_freq[i], _emitter_idx=i, **kwargs)
             for i in range(self.num_emitters)
         ]
 
+    @property
     def a(self):
         """Returns the photon annilihation operator for the cavity"""
         return tensor(destroy(self.num_photons + 1), *([qeye(2)] * self.num_emitters))
 
     def sigma(self, emitter: int):
         """Returns the emitter lowering operator for the ith emitter (zero-indexed)."""
-        l = [qeye(self.num_photons + 1)]
-        l += [destroy(2) if emitter == i else qeye(2) for i in range(self.num_emitters)]
-        return tensor(l)
+        return self.emitters[emitter].sigma
 
     def sigma_x(self, emitter: int):
         l = [qeye(self.num_photons + 1)]
@@ -66,18 +79,15 @@ class Cavity:
         return tensor(l)
 
     def g_zero_op(self, order: int):
-        a = self.a()
-        operators = [a.dag()] * order + [a] * order
+        operators = [self.a.dag()] * order + [self.a] * order
         return reduce(mul, operators)
 
     def collapse_ops(self, pump_power: float | None = None):
-        cavity_relaxation = np.sqrt(self.kappa) * self.a()
-        emitter_relaxation = [
-            np.sqrt(emitter.gamma) * self.sigma(i) for i, emitter in enumerate(self.emitters)
-        ]
+        cavity_relaxation = np.sqrt(self.kappa) * self.a
+        emitter_relaxation = [np.sqrt(emitter.gamma) * emitter.sigma for emitter in self.emitters]
         ops = [cavity_relaxation] + emitter_relaxation
         if pump_power is not None:
-            return ops + [pump_power * self.a().dag()]
+            return ops + [pump_power * self.a.dag()]
         return ops
 
     def steady_state(self, pump_frequency: float | None = None, pump_power: float | None = None):
@@ -87,23 +97,18 @@ class Cavity:
     def spectrum(self, frequencies: list, pump_power: float | None = None):
         pump_power = pump_power or self.kappa / 50
         H = self.hamiltonian()
-        a = self.a()
-        return spectrum(H, frequencies, self.collapse_ops(pump_power), a.dag(), a)
+        return spectrum(H, frequencies, self.collapse_ops(pump_power), self.a.dag(), self.a)
 
     def excitation_likelihoods(self):
-        number_ops = [self.a().dag() * self.a()]
-        for i in range(self.num_emitters):
-            sigma = self.sigma(i)
-            number_ops.append(sigma.dag() * sigma)
-        return number_ops
+        return [self.a.dag() * self.a] + [em.sigma.dag() * em.sigma for em in self.emitters]
 
     def hamiltonian(self, pump_freq: float | None = None, pump_rate: float = 1):
         """Returns the full qutip hamiltonian"""
-        a = self.a()
+        a = self.a
         if pump_freq is not None:
             H = (self.cavity_freq - pump_freq) * a.dag() * a
-            for i, emitter in enumerate(self.emitters):
-                s = self.sigma(i)
+            for emitter in self.emitters:
+                s = emitter.sigma
                 H += 0.5 * (emitter.frequency - pump_freq) * s.dag() * s + emitter.g * (
                     a.dag() * s + a * s.dag()
                 )
@@ -112,8 +117,8 @@ class Cavity:
 
         else:
             H = self.cavity_freq * a.dag() * a
-            for i, emitter in enumerate(self.emitters):
-                s = self.sigma(i)
+            for emitter in self.emitters:
+                s = emitter.sigma
                 H += emitter.frequency * s.dag() * s
                 H += emitter.g * (a.dag() * s + a * s.dag())
             return H
@@ -175,11 +180,9 @@ class Cavity:
 
     def effective_hamiltonian(self):
         emitter_terms = [
-            self.gamma[i] / 2 * self.sigma(i).dag() * self.sigma(i)
-            for i in range(self.num_emitters)
+            emitter.gamma / 2 * emitter.sigma.dag() * emitter.sigma for emitter in self.emitters
         ]
-        a = self.a()
-        H_eff = self.hamiltonian() - 1j * self.kappa / 2 * a.dag() * a - 1j * sum(emitter_terms)
+        H_eff = self.hamiltonian() - 1j * self.kappa / 2 * self.a.dag() * self.a - 1j * sum(emitter_terms)
         return H_eff
 
     def emitter_quality(self, state):
@@ -229,14 +232,13 @@ def g_correlations(
     drive_freq: float, cavity: Cavity, orders: list[int], pump_power: float
 ) -> float:
     H = cavity.hamiltonian(pump_freq=drive_freq, pump_rate=pump_power)
-    a = cavity.a()
     c_ops = cavity.collapse_ops()
     ss = steadystate(H, c_ops)
 
     correlation_ops = [cavity.g_zero_op(order=o) for o in orders]
 
     correlations = [expect(ss, op) for op in correlation_ops]
-    n = expect(ss, a.dag() * a)
+    n = expect(ss, cavity.a.dag() * cavity.a)
 
     normalized_correlation = [corr / n**o for corr, o in zip(correlations, orders)]
     return np.real(normalized_correlation)
