@@ -2,6 +2,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field, fields
 from functools import reduce
 from operator import mul
+from itertools import product
+from dataclasses import replace
 
 import numpy as np
 import qutip
@@ -60,7 +62,13 @@ class Cavity:
     def emitters(self):
         kwargs = dict(_cavity_num_photons=self.num_photons, _cavity_num_emitters=self.num_emitters)
         return [
-            Emitter(g=self.g[i], gamma=self.gamma[i], frequency=self.emitter_freq[i], _emitter_idx=i, **kwargs)
+            Emitter(
+                g=self.g[i],
+                gamma=self.gamma[i],
+                frequency=self.emitter_freq[i],
+                _emitter_idx=i,
+                **kwargs,
+            )
             for i in range(self.num_emitters)
         ]
 
@@ -182,7 +190,11 @@ class Cavity:
         emitter_terms = [
             emitter.gamma / 2 * emitter.sigma.dag() * emitter.sigma for emitter in self.emitters
         ]
-        H_eff = self.hamiltonian() - 1j * self.kappa / 2 * self.a.dag() * self.a - 1j * sum(emitter_terms)
+        H_eff = (
+            self.hamiltonian()
+            - 1j * self.kappa / 2 * self.a.dag() * self.a
+            - 1j * sum(emitter_terms)
+        )
         return H_eff
 
     def emitter_quality(self, state):
@@ -291,4 +303,75 @@ def g_correlation_swept_pump(
     )
     fig.add_trace(spectrum_trace, row=2, col=1)
 
+    return fig
+
+
+def _g_correlation_with_emitter_detuning(delta_e_and_wd, cavity: Cavity, order, pump_power):
+    """This is meant for use within `g_correlation_vs_emitter_detuning()`."""
+    ΔE, wd = delta_e_and_wd
+
+    emitter_freqs = cavity.emitter_freq
+    emitter_freqs[1] += ΔE
+    cavity = replace(cavity, emitter_freq=emitter_freqs)
+
+    H = cavity.hamiltonian(pump_freq=wd, pump_rate=cavity.kappa / 50)
+    c_ops = cavity.collapse_ops()
+
+    ss = steadystate(H, c_ops)
+    g2_op = cavity.g_zero_op(order=2)
+
+    G2 = expect(ss, g2_op)
+    n = expect(ss, cavity.a.dag() * cavity.a)
+
+    g2 = G2 / n**2
+
+    return np.real(g2)
+
+
+def g_correlation_vs_emitter_detuning(
+    cavity: Cavity,
+    order: int,
+    second_emitter_detunings: Sequence[float],
+    drive_frequencies: Sequence[float],
+    pump_power=None,
+    parallel=False,
+) -> go.Figure:
+    """Generate a heatmap of g-correlation at `order` vs emitter-emitter detuning for 2 emitters."""
+    pump_power = pump_power or cavity.kappa / 50
+    points = list(product(second_emitter_detunings, drive_frequencies))
+
+    if parallel:
+        # OpenBLAS (used by qutip) ordinarily uses multithreading. This interferes with multicore
+        # scheduling, preventing the use of `parallel_map`, so let's temporarily disable that.
+        with threadpool_limits(limits=1, user_api="blas"):
+            correlations_expect = parallel_map(
+                _g_correlation_with_emitter_detuning,
+                points,
+                task_kwargs=dict(cavity=cavity, order=order, pump_power=pump_power),
+                progress_bar=True,
+            )
+    else:
+        # At this point I'm not sure if it's safe for all users to enable parallelism by default
+        correlations_expect = [
+            _g_correlation_with_emitter_detuning(wd, cavity, order, pump_power)
+            for wd in tqdm(points)
+        ]
+
+    g2s = np.reshape(correlations_expect, (len(second_emitter_detunings), len(drive_frequencies))).T
+
+    color_scale = [[0.0, "red"], [0.5, "white"], [1.0, "blue"]]
+
+    g2s = np.clip(g2s, a_min=None, a_max=2)
+
+    fig = go.Figure(
+        go.Heatmap(
+            x=second_emitter_detunings,
+            y=drive_frequencies,
+            z=g2s,
+            colorscale=color_scale,
+        )
+    )
+    fig.update_layout(title=f"g{order}(0)", width=800, height=800)
+    fig.update_xaxes(title="ΔE")
+    fig.update_yaxes(title="ω")
     return fig
