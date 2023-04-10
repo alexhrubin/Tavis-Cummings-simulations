@@ -336,7 +336,7 @@ def _g_correlation_with_emitter_detuning(delta_e_and_wd, cavity: Cavity, order, 
     ΔE, wd = delta_e_and_wd
 
     emitter_freqs = cavity.emitter_freq
-    emitter_freqs[1] += ΔE
+    emitter_freqs[1] = emitter_freqs[0] + ΔE
     cavity = replace(cavity, emitter_freq=emitter_freqs)
 
     H = cavity.hamiltonian(pump_freq=wd, pump_rate=cavity.kappa / 50)
@@ -423,7 +423,7 @@ def g_correlation_vs_emitter_detuning(
                 visible=False,
             )
         )
-        clear_output(wait=True)
+        clear_output()
 
     fig.data[0].visible = True
 
@@ -438,9 +438,7 @@ def g_correlation_vs_emitter_detuning(
             step["args"][0]["visible"][i] = True
             steps.append(step)
 
-        slider = go.layout.Slider(
-            steps=steps, currentvalue={"prefix": f"{property_name}: {val:.6f}"}
-        )
+        slider = go.layout.Slider(steps=steps, currentvalue={"prefix": f"{property_name}: "})
         fig.update_layout(sliders=[slider])
 
     fig.update_layout(title=f"g{order}(0)", width=800, height=800)
