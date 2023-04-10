@@ -9,16 +9,29 @@ import numpy as np
 import qutip
 from plotly import graph_objects as go
 from plotly.subplots import make_subplots
-from qutip import basis, destroy, expect, mesolve, qeye, sigmax, spectrum, steadystate, tensor
+from qutip import (
+    basis,
+    destroy,
+    expect,
+    mesolve,
+    qeye,
+    sigmax,
+    spectrum,
+    steadystate,
+    tensor,
+    sigmaz,
+)
 from qutip.parallel import parallel_map
 from threadpoolctl import threadpool_limits
 from tqdm import tqdm
+from IPython.display import clear_output
 
 
 @dataclass
 class Emitter:
     g: float
     gamma: float
+    dephasing: float  # equivalent to 1/T2, maybe there's a nicer name...
     frequency: float
 
     _emitter_idx: int
@@ -34,6 +47,15 @@ class Emitter:
         ]
         return tensor(qeye(self._cavity_num_photons + 1), *emitter_ops)
 
+    @property
+    def sigma_z(self):
+        """Returns the Z operator for this emitter."""
+        emitter_ops = [
+            sigmaz() if self._emitter_idx == i else qeye(2)
+            for i in range(self._cavity_num_emitters)
+        ]
+        return tensor(qeye(self._cavity_num_photons + 1), *emitter_ops)
+
 
 @dataclass
 class Cavity:
@@ -41,8 +63,9 @@ class Cavity:
     cavity_freq: float
     emitter_freq: list[float] = field(metadata={"length_checked": True})
     g: list[float] = field(metadata={"length_checked": True})
-    gamma: list[float] = field(metadata={"length_checked": True})
-    kappa: float
+    gamma: list[float] = field(metadata={"length_checked": True}, default=0)
+    dephasing: list[float] = field(metadata={"length_checked": True}, default=0)
+    kappa: float = 0
     num_photons: int = 1
 
     def __post_init__(self):
@@ -65,6 +88,7 @@ class Cavity:
             Emitter(
                 g=self.g[i],
                 gamma=self.gamma[i],
+                dephasing=self.dephasing[i],
                 frequency=self.emitter_freq[i],
                 _emitter_idx=i,
                 **kwargs,
@@ -93,7 +117,8 @@ class Cavity:
     def collapse_ops(self, pump_power: float | None = None):
         cavity_relaxation = np.sqrt(self.kappa) * self.a
         emitter_relaxation = [np.sqrt(emitter.gamma) * emitter.sigma for emitter in self.emitters]
-        ops = [cavity_relaxation] + emitter_relaxation
+        emitter_dephasing = [np.sqrt(em.dephasing) * em.sigma_z for em in self.emitters]
+        ops = [cavity_relaxation] + emitter_relaxation + emitter_dephasing
         if pump_power is not None:
             return ops + [pump_power * self.a.dag()]
         return ops
@@ -328,6 +353,32 @@ def _g_correlation_with_emitter_detuning(delta_e_and_wd, cavity: Cavity, order, 
     return np.real(g2)
 
 
+def _map(
+    func,
+    values,
+    *,
+    args=(),
+    kwargs=None,
+    parallel: bool = False,
+    parallel_progress_bar: bool = True,
+):
+    """Helper to allow switching between sequential and parallel mapping."""
+    if parallel:
+        # OpenBLAS (used by qutip) ordinarily uses multithreading. This interferes with multicore
+        # scheduling, preventing the use of `parallel_map`, so let's temporarily disable that.
+        with threadpool_limits(limits=1, user_api="blas"):
+            return parallel_map(
+                func,
+                values,
+                task_args=args,
+                task_kwargs=kwargs,
+                progress_bar=parallel_progress_bar,
+            )
+    else:
+        # At this point I'm not sure if it's safe for all users to enable parallelism by default
+        return [func(value, *args, **kwargs) for value in tqdm(values)]
+
+
 def g_correlation_vs_emitter_detuning(
     cavity: Cavity,
     order: int,
@@ -335,42 +386,63 @@ def g_correlation_vs_emitter_detuning(
     drive_frequencies: Sequence[float],
     pump_power=None,
     parallel=False,
+    alternate_sweep: dict[str, Sequence] | None = None,
 ) -> go.Figure:
     """Generate a heatmap of g-correlation at `order` vs emitter-emitter detuning for 2 emitters."""
     pump_power = pump_power or cavity.kappa / 50
     points = list(product(second_emitter_detunings, drive_frequencies))
-
-    if parallel:
-        # OpenBLAS (used by qutip) ordinarily uses multithreading. This interferes with multicore
-        # scheduling, preventing the use of `parallel_map`, so let's temporarily disable that.
-        with threadpool_limits(limits=1, user_api="blas"):
-            correlations_expect = parallel_map(
-                _g_correlation_with_emitter_detuning,
-                points,
-                task_kwargs=dict(cavity=cavity, order=order, pump_power=pump_power),
-                progress_bar=True,
-            )
-    else:
-        # At this point I'm not sure if it's safe for all users to enable parallelism by default
-        correlations_expect = [
-            _g_correlation_with_emitter_detuning(wd, cavity, order, pump_power)
-            for wd in tqdm(points)
-        ]
-
-    g2s = np.reshape(correlations_expect, (len(second_emitter_detunings), len(drive_frequencies))).T
-
+    alternate_sweep = alternate_sweep or {"num_photons": [cavity.num_photons]}  # dummy sweep
     color_scale = [[0.0, "red"], [0.5, "white"], [1.0, "blue"]]
+    fig = go.Figure()
 
-    g2s = np.clip(g2s, a_min=None, a_max=2)
+    if len(alternate_sweep) > 1:
+        raise ValueError("More than one alternate sweep value not currently supported.")
 
-    fig = go.Figure(
-        go.Heatmap(
-            x=second_emitter_detunings,
-            y=drive_frequencies,
-            z=g2s,
-            colorscale=color_scale,
+    property_name = list(alternate_sweep.keys())[0]
+    property_values = list(alternate_sweep.values())[0]
+
+    for value in tqdm(property_values):
+        cavity = replace(cavity, **{property_name: value})
+
+        correlations = _map(
+            _g_correlation_with_emitter_detuning,
+            points,
+            kwargs=dict(cavity=cavity, order=order, pump_power=pump_power),
+            parallel=parallel,
         )
-    )
+
+        g2s = np.reshape(correlations, (len(second_emitter_detunings), len(drive_frequencies))).T
+        g2s = np.clip(g2s, a_min=None, a_max=2)
+
+        fig.add_trace(
+            go.Heatmap(
+                x=second_emitter_detunings,
+                y=drive_frequencies,
+                z=g2s,
+                colorscale=color_scale,
+                visible=False,
+            )
+        )
+        clear_output(wait=True)
+
+    fig.data[0].visible = True
+
+    if len(property_values) > 1:
+        steps = []
+        for i, val in enumerate(property_values):
+            step = dict(
+                method="update",
+                label=f"{property_name}: {val:.2f}",
+                args=[{"visible": [False] * len(fig.data)}],
+            )
+            step["args"][0]["visible"][i] = True
+            steps.append(step)
+
+        slider = go.layout.Slider(
+            steps=steps, currentvalue={"prefix": f"{property_name}: {val:.6f}"}
+        )
+        fig.update_layout(sliders=[slider])
+
     fig.update_layout(title=f"g{order}(0)", width=800, height=800)
     fig.update_xaxes(title="ΔE")
     fig.update_yaxes(title="ω")

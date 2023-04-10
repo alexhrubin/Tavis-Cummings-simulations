@@ -1,7 +1,9 @@
+ipython==8.11.0
 matplotlib==3.7.1
 nbformat==5.8.0
 numpy==1.24.2
 plotly==5.13.1
+pytest==7.3.0
 qutip==4.7.1
 threadpoolctl==3.1.0
 tqdm==4.65.0
