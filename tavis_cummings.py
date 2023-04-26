@@ -1,4 +1,4 @@
-from collections.abc import Sequence
+from collections.abc import Sequence, Callable
 from dataclasses import dataclass, field, fields
 from functools import reduce
 from operator import mul
@@ -32,7 +32,7 @@ class Emitter:
     g: float
     gamma: float
     dephasing: float  # equivalent to 1/T2, maybe there's a nicer name...
-    frequency: float
+    frequency: float | Callable
 
     _emitter_idx: int
     _cavity_num_photons: int
@@ -68,7 +68,12 @@ class Cavity:
     kappa: float = 0
     num_photons: int = 1
 
+    _time_dependent: bool = False
+
     def __post_init__(self):
+        if any(isinstance(f, Callable) for f in self.emitter_freq):
+            self._time_dependent = True
+
         for field_ in fields(self):
             value = getattr(self, field_.name)
             if field_.metadata.get("length_checked"):
@@ -135,26 +140,28 @@ class Cavity:
     def excitation_likelihoods(self):
         return [self.a.dag() * self.a] + [em.sigma.dag() * em.sigma for em in self.emitters]
 
-    def hamiltonian(self, pump_freq: float | None = None, pump_rate: float = 1):
+    def hamiltonian(self, pump_freq: float = 0, pump_rate: float = 0):
         """Returns the full qutip hamiltonian"""
-        a = self.a
-        if pump_freq is not None:
-            H = (self.cavity_freq - pump_freq) * a.dag() * a
+        pump_rate = self.kappa / 50 if pump_freq != 0 and pump_rate == 0 else pump_rate
+        a = self.a 
+        
+        if self._time_dependent:
+            H0 = (self.cavity_freq - pump_freq) * a.dag() * a + pump_rate * (a + a.dag())
+            time_deps = []
             for emitter in self.emitters:
                 s = emitter.sigma
-                H += 0.5 * (emitter.frequency - pump_freq) * s.dag() * s + emitter.g * (
-                    a.dag() * s + a * s.dag()
-                )
-                H += pump_rate * (a + a.dag())
-            return H
+                time_deps.append([s.dag() * s, emitter.frequency])
+                H0 += emitter.g * (a.dag() * s + a * s.dag())
+                H0 += - pump_freq * s.dag() * s
+            return [H0, *time_deps]
 
-        else:
-            H = self.cavity_freq * a.dag() * a
-            for emitter in self.emitters:
-                s = emitter.sigma
-                H += emitter.frequency * s.dag() * s
-                H += emitter.g * (a.dag() * s + a * s.dag())
-            return H
+
+        H = (self.cavity_freq - pump_freq) * a.dag() * a + pump_rate * (a + a.dag())
+        for emitter in self.emitters:
+            s = emitter.sigma
+            H += (emitter.frequency - pump_freq) * s.dag() * s 
+            H += emitter.g * (a.dag() * s + a * s.dag())
+        return H
 
     def cavity_state(self, num_photons: int):
         if num_photons > self.num_photons:
@@ -195,12 +202,12 @@ class Cavity:
             states.append(self.emitter_state(i))
         return sum(states) / np.sqrt(self.num_emitters)
 
-    def mesolve(self, initial_state, times, measurements=None, pump_freq=None, pump_rate=1):
+    def mesolve(self, initial_state, times, measurements=None, pump_freq=0, pump_rate=0, options=None):
         """Evolve `initial_state` through `times` according to the Lindbladian."""
         H = self.hamiltonian(pump_freq, pump_rate)
         c_ops = self.collapse_ops()
         measurements = measurements or self.excitation_likelihoods()
-        return mesolve(H, initial_state, times, c_ops, measurements)
+        return mesolve(H, initial_state, times, c_ops, measurements, options=options)
 
     def product_state(self, cavity: int = 0, **kwargs):
         if cavity > self.num_photons:
@@ -313,17 +320,17 @@ def g_correlation_swept_pump(
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True)
     fig.update_yaxes(title="Zero-time correlations", row=1, col=1)
     fig.update_yaxes(title="Output spectrum", row=2, col=1)
-    fig.update_xaxes(title="ω - ω_c", row=2, col=1)
+    fig.update_xaxes(title="ω", row=2, col=1)
 
     # Plot the g-function correlations in the top panel
     for o, corr in zip(orders, correlations_expect):
-        trace = go.Scatter(x=drive_frequencies - cavity.cavity_freq, y=corr, name=f"g{o}(0)")
+        trace = go.Scatter(x=drive_frequencies, y=corr, name=f"g{o}(0)")
         fig.add_trace(trace, row=1, col=1)
 
     # Plot the emission spectrum of the cavity in the lower panel
     spectrum_trace = go.Scatter(
-        x=drive_frequencies - cavity.cavity_freq,
-        y=cavity.spectrum(drive_frequencies),
+        x=drive_frequencies,
+        y=cavity.spectrum(drive_frequencies, pump_power),
         name="Transmission spectrum",
     )
     fig.add_trace(spectrum_trace, row=2, col=1)
