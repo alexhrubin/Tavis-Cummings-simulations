@@ -71,9 +71,6 @@ class Cavity:
     _time_dependent: bool = False
 
     def __post_init__(self):
-        if any(isinstance(f, Callable) for f in self.emitter_freq):
-            self._time_dependent = True
-
         for field_ in fields(self):
             value = getattr(self, field_.name)
             if field_.metadata.get("length_checked"):
@@ -85,6 +82,9 @@ class Cavity:
                         )
                 else:
                     setattr(self, field_.name, [value] * self.num_emitters)
+
+        if any(isinstance(f, Callable) for f in self.emitter_freq):
+            self._time_dependent = True
 
     @property
     def emitters(self):
@@ -268,8 +268,7 @@ def plot_populations(result: qutip.solver.Result, title: str = ""):
                 mode="lines",
             )
         )
-
-    fig.show()
+    return fig
 
 
 def g_correlations(
@@ -331,7 +330,7 @@ def g_correlation_swept_pump(
     spectrum_trace = go.Scatter(
         x=drive_frequencies,
         y=cavity.spectrum(drive_frequencies, pump_power),
-        name="Transmission spectrum",
+        name="Transmission",
     )
     fig.add_trace(spectrum_trace, row=2, col=1)
 
