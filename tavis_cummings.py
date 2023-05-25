@@ -25,6 +25,7 @@ from qutip.parallel import parallel_map
 from threadpoolctl import threadpool_limits
 from tqdm import tqdm
 from IPython.display import clear_output
+from scipy.special import jv
 
 
 @dataclass
@@ -37,6 +38,10 @@ class Emitter:
     _emitter_idx: int
     _cavity_num_photons: int
     _cavity_num_emitters: int
+
+    base_frequency: float = 4e3
+    modulation_index: float = 0.1
+    modulate: bool = False
 
     @property
     def sigma(self):
@@ -68,6 +73,7 @@ class Cavity:
     kappa: float = 0
     num_photons: int = 1
 
+    modulate: bool = False
     _time_dependent: bool = False
 
     def __post_init__(self):
@@ -95,6 +101,7 @@ class Cavity:
                 gamma=self.gamma[i],
                 dephasing=self.dephasing[i],
                 frequency=self.emitter_freq[i],
+                modulate=self.modulate,
                 _emitter_idx=i,
                 **kwargs,
             )
@@ -176,8 +183,8 @@ class Cavity:
 
         if excited_emitter_index < 0:
             raise ValueError(f"Invalid emitter index {excited_emitter_index}!")
-        if excited_emitter_index > self.num_emitters:
-            raise ValueError(f"Cavity only has {self.num_emitters} emitters!")
+        if excited_emitter_index >= self.num_emitters:
+            raise ValueError(f"Cavity only has {self.num_emitters} emitters (indexed from 0)!")
 
         component_bases = [
             basis(2, 1) if i == excited_emitter_index else basis(2, 0)
@@ -280,8 +287,8 @@ def g_correlations(
 
     correlation_ops = [cavity.g_zero_op(order=o) for o in orders]
 
-    correlations = [expect(ss, op) for op in correlation_ops]
-    n = expect(ss, cavity.a.dag() * cavity.a)
+    correlations = [expect(op, ss) for op in correlation_ops]
+    n = expect(cavity.a.dag() * cavity.a, ss)
 
     normalized_correlation = [corr / n**o for corr, o in zip(correlations, orders)]
     return np.real(normalized_correlation)
@@ -342,7 +349,7 @@ def _g_correlation_with_emitter_detuning(delta_e_and_wd, cavity: Cavity, order, 
     ΔE, wd = delta_e_and_wd
 
     emitter_freqs = cavity.emitter_freq
-    emitter_freqs[1] = emitter_freqs[0] + ΔE
+    emitter_freqs[-1] = emitter_freqs[0] + ΔE
     cavity = replace(cavity, emitter_freq=emitter_freqs)
 
     H = cavity.hamiltonian(pump_freq=wd, pump_rate=cavity.kappa / 50)
@@ -351,8 +358,8 @@ def _g_correlation_with_emitter_detuning(delta_e_and_wd, cavity: Cavity, order, 
     ss = steadystate(H, c_ops)
     g2_op = cavity.g_zero_op(order=2)
 
-    G2 = expect(ss, g2_op)
-    n = expect(ss, cavity.a.dag() * cavity.a)
+    G2 = expect(g2_op, ss)
+    n = expect(cavity.a.dag() * cavity.a, ss)
 
     g2 = G2 / n**2
 
