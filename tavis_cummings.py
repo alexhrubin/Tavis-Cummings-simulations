@@ -1,9 +1,11 @@
+from __future__ import annotations
 from collections.abc import Sequence, Callable
 from dataclasses import dataclass, field, fields
 from functools import reduce
 from operator import mul
 from itertools import product
 from dataclasses import replace
+from typing import Union, Optional, List, Dict
 
 import numpy as np
 import qutip
@@ -33,7 +35,7 @@ class Emitter:
     g: float
     gamma: float
     dephasing: float  # equivalent to 1/T2, maybe there's a nicer name...
-    frequency: float | Callable
+    frequency: Union[float, Callable]
 
     _emitter_idx: int
     _cavity_num_photons: int
@@ -66,10 +68,10 @@ class Emitter:
 class Cavity:
     num_emitters: int
     cavity_freq: float
-    emitter_freq: list[float] = field(metadata={"length_checked": True})
-    g: list[float] = field(metadata={"length_checked": True})
-    gamma: list[float] = field(metadata={"length_checked": True}, default=0)
-    dephasing: list[float] = field(metadata={"length_checked": True}, default=0)
+    emitter_freq: List[float] = field(metadata={"length_checked": True})
+    g: List[float] = field(metadata={"length_checked": True})
+    gamma: List[float] = field(metadata={"length_checked": True}, default=0)
+    dephasing: List[float] = field(metadata={"length_checked": True}, default=0)
     kappa: float = 0
     num_photons: int = 1
 
@@ -126,7 +128,7 @@ class Cavity:
         operators = [self.a.dag()] * order + [self.a] * order
         return reduce(mul, operators)
 
-    def collapse_ops(self, pump_power: float | None = None):
+    def collapse_ops(self, pump_power: Optional[float] = None):
         cavity_relaxation = np.sqrt(self.kappa) * self.a
         emitter_relaxation = [np.sqrt(emitter.gamma) * emitter.sigma for emitter in self.emitters]
         emitter_dephasing = [np.sqrt(em.dephasing) * em.sigma_z for em in self.emitters]
@@ -135,11 +137,11 @@ class Cavity:
             return ops + [pump_power * self.a.dag()]
         return ops
 
-    def steady_state(self, pump_frequency: float | None = None, pump_power: float | None = None):
+    def steady_state(self, pump_frequency: Optional[float] = None, pump_power: Optional[float] = None):
         H = self.hamiltonian(pump_frequency, pump_power)
         return steadystate(H, self.collapse_ops(pump_power))
 
-    def spectrum(self, frequencies: list, pump_power: float | None = None):
+    def spectrum(self, frequencies: list, pump_power: Optional[float] = None):
         pump_power = pump_power or self.kappa / 50
         H = self.hamiltonian()
         return spectrum(H, frequencies, self.collapse_ops(pump_power), self.a.dag(), self.a)
@@ -279,7 +281,7 @@ def plot_populations(result: qutip.solver.Result, title: str = ""):
 
 
 def g_correlations(
-    drive_freq: float, cavity: Cavity, orders: list[int], pump_power: float
+    drive_freq: float, cavity: Cavity, orders: List[int], pump_power: float
 ) -> float:
     H = cavity.hamiltonian(pump_freq=drive_freq, pump_rate=pump_power)
     c_ops = cavity.collapse_ops()
@@ -296,7 +298,7 @@ def g_correlations(
 
 def g_correlation_swept_pump(
     cavity: Cavity,
-    orders: int | list[int],
+    orders: Union[int, List[int]],
     drive_frequencies: Sequence[float],
     pump_power=None,
     parallel=False,
@@ -399,7 +401,7 @@ def g_correlation_vs_emitter_detuning(
     drive_frequencies: Sequence[float],
     pump_power=None,
     parallel=False,
-    alternate_sweep: dict[str, Sequence] | None = None,
+    alternate_sweep: Optional[Dict[str, Sequence]] = None,
 ) -> go.Figure:
     """Generate a heatmap of g-correlation at `order` vs emitter-emitter detuning for 2 emitters."""
     pump_power = pump_power or cavity.kappa / 50
